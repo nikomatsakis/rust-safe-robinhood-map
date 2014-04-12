@@ -135,6 +135,20 @@ pub type FullBucketImm<'table,K,V> = FullBucket<ImmTableRef<'table,K,V>>;
 pub type EmptyBucketMut<'table,K,V> = EmptyBucket<MutTableRef<'table,K,V>>;
 pub type FullBucketMut<'table,K,V> = FullBucket<MutTableRef<'table,K,V>>;
 
+impl<K,V,M:TableRef<K,V>> EmptyBucket<M> {
+    pub fn to_table_ref(self) -> M {
+        self.table_ref
+    }
+
+    pub fn table_ref<'a>(&'a self) -> &'a M {
+        &self.table_ref
+    }
+
+    pub fn table<'a>(&'a self) -> &'a Table<K,V> {
+        self.table_ref.table()
+    }
+}
+
 impl<K,V,M:TableRef<K,V>> FullBucket<M> {
     pub fn index(&self) -> uint {
         self.index
@@ -146,22 +160,22 @@ impl<K,V,M:TableRef<K,V>> FullBucket<M> {
 
     pub fn freeze<'a>(&'a self) -> FullBucketImm<'a,K,V> {
         FullBucket {
-            table_ref: self.table.freeze().borrow(),
+            table_ref: self.table_ref.table().borrow(),
             index: self.index,
             hash: self.hash
         }
     }
 
     pub fn to_table_ref(self) -> M {
-        self.table
+        self.table_ref
     }
 
-    pub fn table_ref<'a>(&'a self) -> &M {
-        &self.table
+    pub fn table_ref<'a>(&'a self) -> &'a M {
+        &self.table_ref
     }
 
     pub fn table<'a>(&'a self) -> &'a Table<K,V> {
-        &self.table.table()
+        self.table_ref.table()
     }
 }
 
@@ -178,9 +192,9 @@ impl<K,V,M:TableRef<K,V>> HitOps for M {
         assert!(index < self.capacity());
         let hash = self.hash(index);
         if hash == EMPTY_BUCKET {
-            EmptyBucket(EmptyBucket { table: self, index: index })
+            EmptyBucket(EmptyBucket { table_ref: self, index: index })
         } else {
-            FullBucket(FullBucket { table: self, index: index,
+            FullBucket(FullBucket { table_ref: self, index: index,
                                     hash: SafeHash { hash: hash } })
         }
     }
@@ -196,11 +210,11 @@ impl<'table,K,V> EmptyBucket<MutTableRef<'table,K,V>> {
         let index = self.index as int; // FIXME
         unsafe {
             assert_eq!(self.table().hashes[self.index], 0);
-            self.table.hashes[self.index] = hash.to_u64();
-            move_val_init(&mut *self.table.keys.offset(index), key);
-            move_val_init(&mut *self.table.values.offset(index), value);
+            self.table().hashes[self.index] = hash.to_u64();
+            move_val_init(&mut *self.table().keys.offset(index), key);
+            move_val_init(&mut *self.table().values.offset(index), value);
         }
-        self.table.size += 1;
+        self.table().size += 1;
         FullBucket { index: self.index, hash: hash, table: self.table }
     }
 }
