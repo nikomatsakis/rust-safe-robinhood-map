@@ -134,7 +134,7 @@ fn swap<K:TotalEq,V>(mut table: &mut Table<K,V>,
     for dib in range_inclusive(0u, table.size()) {
         let probe = probe(&table, hash, dib);
 
-        let mut full_bucket = match table.peek(probe) {
+        let mut full_bucket = match hit::peek(table, probe) {
             EmptyBucket(b) => {
                 // Found a hole!
                 b.put(hash, k, v);

@@ -41,12 +41,12 @@ pub enum BucketState<M> {
 }
 
 pub struct EmptyBucket<M> {
-    table_ref: M,
+    table: M,
     index: uint,
 }
 
 pub struct FullBucket<M> {
-    table_ref: M,
+    table: M,
     index: uint,
     hash: SafeHash,
 }
@@ -61,47 +61,29 @@ pub struct FullBucket<M> {
  */
 pub trait TableRef<K,V> {
     fn size(&self) -> uint {
-        self.table().size
+        self.borrow().size
     }
 
     fn capacity(&self) -> uint {
-        self.table().capacity
+        self.borrow().capacity
     }
 
     fn hash(&self, index: uint) -> u64 {
-        self.table().hashes[index]
+        self.borrow().hashes[index]
     }
 
-    fn table<'a>(&'a self) -> &'a Table<K,V>;
+    fn borrow<'a>(&'a self) -> &'a Table<K,V>;
 }
 
-pub struct ImmTableRef<'table,K,V> {
-    table: &'table Table<K,V>
-}
-
-impl<'table,K,V> TableRef<K,V> for ImmTableRef<'table,K,V> {
-    fn table<'a>(&'a self) -> &'a Table<K,V> {
-        &*self.table
+impl<'table,K,V> TableRef<K,V> for &'table Table<K,V> {
+    fn borrow<'a>(&'a self) -> &'a Table<K,V> {
+        &**self
     }
 }
 
-pub struct MutTableRef<'table,K,V> {
-    table: &'table mut Table<K,V>
-}
-
-impl<'table,K,V> TableRef<K,V> for MutTableRef<'table,K,V> {
-    fn table<'a>(&'a self) -> &'a Table<K,V> {
-        &*self.table
-    }
-}
-
-impl<K,V> Table<K,V> {
-    pub fn borrow<'a>(&'a self) -> ImmTableRef<'a,K,V> {
-        ImmTableRef { table: self }
-    }
-
-    pub fn borrow_mut<'a>(&'a mut self) -> MutTableRef<'a,K,V> {
-        MutTableRef { table: self }
+impl<'table,K,V> TableRef<K,V> for &'table mut Table<K,V> {
+    fn borrow<'a>(&'a self) -> &'a Table<K,V> {
+        &**self
     }
 }
 
@@ -130,22 +112,18 @@ impl SafeHash {
 
 //////////////////////////////////////////////////////////////////////////
 
-pub type EmptyBucketImm<'table,K,V> = EmptyBucket<ImmTableRef<'table,K,V>>;
-pub type FullBucketImm<'table,K,V> = FullBucket<ImmTableRef<'table,K,V>>;
-pub type EmptyBucketMut<'table,K,V> = EmptyBucket<MutTableRef<'table,K,V>>;
-pub type FullBucketMut<'table,K,V> = FullBucket<MutTableRef<'table,K,V>>;
+pub type EmptyBucketImm<'table,K,V> = EmptyBucket<&'table Table<K,V>>;
+pub type FullBucketImm<'table,K,V> = FullBucket<&'table Table<K,V>>;
+pub type EmptyBucketMut<'table,K,V> = EmptyBucket<&'table mut Table<K,V>>;
+pub type FullBucketMut<'table,K,V> = FullBucket<&'table mut Table<K,V>>;
 
 impl<K,V,M:TableRef<K,V>> EmptyBucket<M> {
-    pub fn to_table_ref(self) -> M {
-        self.table_ref
+    pub fn to_table(self) -> M {
+        self.table
     }
 
-    pub fn table_ref<'a>(&'a self) -> &'a M {
-        &self.table_ref
-    }
-
-    pub fn table<'a>(&'a self) -> &'a Table<K,V> {
-        self.table_ref.table()
+    pub fn table<'a>(&'a self) -> &'a M {
+        &self.table
     }
 }
 
@@ -160,22 +138,18 @@ impl<K,V,M:TableRef<K,V>> FullBucket<M> {
 
     pub fn freeze<'a>(&'a self) -> FullBucketImm<'a,K,V> {
         FullBucket {
-            table_ref: self.table_ref.table().borrow(),
+            table: self.table.borrow(),
             index: self.index,
             hash: self.hash
         }
     }
 
-    pub fn to_table_ref(self) -> M {
-        self.table_ref
+    pub fn to_table(self) -> M {
+        self.table
     }
 
-    pub fn table_ref<'a>(&'a self) -> &'a M {
-        &self.table_ref
-    }
-
-    pub fn table<'a>(&'a self) -> &'a Table<K,V> {
-        self.table_ref.table()
+    pub fn table<'a>(&'a self) -> &'a M {
+        &self.table
     }
 }
 
@@ -187,14 +161,21 @@ pub trait HitOps {
     fn peek(self, index: uint) -> BucketState<Self>;
 }
 
+pub fn peek<K,V,M:TableRef<K,V>>(table: M, index: uint) -> BucketState<M> {
+    // FIXME -- I think this fn is needed due to overagressive autoref
+    // coupled with overagressive borrowck rules that don't permit loans
+    // to be forgotten when reborrowed pointer is mutated
+    table.peek(index)
+}
+
 impl<K,V,M:TableRef<K,V>> HitOps for M {
     fn peek(self, index: uint) -> BucketState<M> {
         assert!(index < self.capacity());
         let hash = self.hash(index);
         if hash == EMPTY_BUCKET {
-            EmptyBucket(EmptyBucket { table_ref: self, index: index })
+            EmptyBucket(EmptyBucket { table: self, index: index })
         } else {
-            FullBucket(FullBucket { table_ref: self, index: index,
+            FullBucket(FullBucket { table: self, index: index,
                                     hash: SafeHash { hash: hash } })
         }
     }
@@ -203,23 +184,23 @@ impl<K,V,M:TableRef<K,V>> HitOps for M {
 ///////////////////////////////////////////////////////////////////////////
 // Operations on buckets
 
-impl<'table,K,V> EmptyBucket<MutTableRef<'table,K,V>> {
+impl<'table,K,V> EmptyBucket<&'table mut Table<K,V>> {
     pub fn put(self, hash: SafeHash, key: K, value: V)
                -> FullBucketMut<'table,K,V>
     {
         let index = self.index as int; // FIXME
         unsafe {
-            assert_eq!(self.table().hashes[self.index], 0);
-            self.table().hashes[self.index] = hash.to_u64();
-            move_val_init(&mut *self.table().keys.offset(index), key);
-            move_val_init(&mut *self.table().values.offset(index), value);
+            assert_eq!(self.table.hashes[self.index], 0);
+            self.table.hashes[self.index] = hash.to_u64();
+            move_val_init(&mut *self.table.keys.offset(index), key);
+            move_val_init(&mut *self.table.values.offset(index), value);
         }
-        self.table().size += 1;
+        self.table.size += 1;
         FullBucket { index: self.index, hash: hash, table: self.table }
     }
 }
 
-impl<'table,K,V> FullBucket<MutTableRef<'table,K,V>> {
+impl<'table,K,V> FullBucket<&'table mut Table<K,V>> {
     pub fn read_mut<'a>(&'a mut self)
                         -> (&'a mut SafeHash, &'a mut K, &'a mut V)
     {
@@ -255,7 +236,7 @@ impl<K,V,M:TableRef<K,V>> FullBucket<M> {
     pub fn read<'a>(&'a self) -> (&'a K, &'a V) {
         unsafe {
             let index = self.index as int; // FIXME
-            let table = self.table.freeze();
+            let table = self.table.borrow();
             (&*table.keys.offset(index),
              &*table.values.offset(index))
         }
