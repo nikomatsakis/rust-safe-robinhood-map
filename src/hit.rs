@@ -24,13 +24,14 @@
  * table reference.
  */
 
-use std::intrinsics::{transmute, move_val_init};
+use std::intrinsics::{size_of, transmute, move_val_init};
 use std::ptr;
+use std::rt::global_heap;
 
 pub struct Table<K,V> {
     capacity: uint,
     size: uint,
-    hashes: ~[u64],
+    hashes: *mut u64,
     keys: *mut K,
     values: *mut V,
 }
@@ -69,7 +70,10 @@ pub trait TableRef<K,V> {
     }
 
     fn hash(&self, index: uint) -> u64 {
-        self.borrow().hashes[index]
+        assert!(index < self.size());
+        unsafe {
+            *self.borrow().hashes.offset(index as int)
+        }
     }
 
     fn borrow<'a>(&'a self) -> &'a Table<K,V>;
@@ -156,6 +160,80 @@ impl<K,V,M:TableRef<K,V>> FullBucket<M> {
 ///////////////////////////////////////////////////////////////////////////
 // Operations on the table
 
+impl<K,V> Table<K,V> {
+    /// Does not initialize the buckets. The caller should ensure they,
+    /// at the very least, set every hash to EMPTY_BUCKET.
+    unsafe fn new_uninitialized(capacity: uint) -> Table<K, V> {
+        let hashes_size =
+            capacity.checked_mul(&size_of::<u64>()).expect("capacity overflow");
+        let keys_size   =
+            capacity.checked_mul(&size_of::< K >()).expect("capacity overflow");
+        let vals_size   =
+            capacity.checked_mul(&size_of::< V >()).expect("capacity overflow");
+
+        /*
+        The following code was my first pass at making RawTable only
+        allocate a single buffer, since that's all it needs. There's
+        no logical reason for this to require three calls to malloc.
+
+        However, I'm not convinced the code below is correct. If you
+        want to take a stab at it, please do! The alignment is
+        especially tricky to get right, especially if you need more
+        alignment than malloc guarantees.
+
+        let hashes_offset = 0;
+        let keys_offset   = align_size(hashes_offset + hashes_size, keys_align);
+        let vals_offset   = align_size(keys_offset + keys_size, vals_align);
+        let end = vals_offset + vals_size;
+
+        let buffer = global_heap::malloc_raw(end);
+
+        let hashes = buffer.offset(hashes_offset) as *mut u64;
+        let keys   = buffer.offset(keys_offset)   as *mut K;
+        let vals   = buffer.offset(vals_offset)   as *mut V;
+
+         */
+
+        let hashes = global_heap::malloc_raw(hashes_size) as *mut u64;
+        let keys   = global_heap::malloc_raw(keys_size)   as *mut K;
+        let values = global_heap::malloc_raw(vals_size)   as *mut V;
+
+        Table {
+            capacity: capacity,
+            size:     0,
+            hashes:   hashes,
+            keys:     keys,
+            values:   values,
+        }
+    }
+
+    /// Creates a new raw table from a given capacity. All buckets are
+    /// initially empty.
+    pub fn new(capacity: uint) -> Table<K, V> {
+        unsafe {
+            let ret = Table::new_uninitialized(capacity);
+
+            for i in range(0, ret.capacity as int) {
+                *ret.hashes.offset(i) = EMPTY_BUCKET;
+            }
+
+            ret
+        }
+    }
+
+    pub fn move_iter(self) -> MoveEntries<K, V> {
+        MoveEntries { table: self, idx: 0 }
+    }
+
+    pub fn size(&self) -> uint {
+        self.borrow().size
+    }
+
+    pub fn capacity(&self) -> uint {
+        self.borrow().capacity
+    }
+}
+
 pub trait HitOps {
     /** Examine a given index and yield its current state. */
     fn peek(self, index: uint) -> BucketState<Self>;
@@ -182,6 +260,39 @@ impl<K,V,M:TableRef<K,V>> HitOps for M {
 }
 
 ///////////////////////////////////////////////////////////////////////////
+//
+
+pub struct MoveEntries<K, V> {
+    table: Table<K, V>,
+    idx: uint,
+}
+
+impl<K, V> Iterator<(SafeHash, K, V)> for MoveEntries<K, V> {
+    fn next(&mut self) -> Option<(SafeHash, K, V)> {
+        while self.idx < self.table.capacity {
+            let i = self.idx;
+            self.idx += 1;
+
+            match peek(&mut self.table, i) {
+                EmptyBucket(_) => {},
+                FullBucket(b) => {
+                    let h = b.hash;
+                    let (_, k, v) = b.take();
+                    return Some((h, k, v));
+                }
+            }
+        }
+
+        None
+    }
+
+    fn size_hint(&self) -> (uint, Option<uint>) {
+        let size = self.table.size;
+        (size, Some(size))
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////
 // Operations on buckets
 
 impl<'table,K,V> EmptyBucket<&'table mut Table<K,V>> {
@@ -190,8 +301,8 @@ impl<'table,K,V> EmptyBucket<&'table mut Table<K,V>> {
     {
         let index = self.index as int; // FIXME
         unsafe {
-            assert_eq!(self.table.hashes[self.index], 0);
-            self.table.hashes[self.index] = hash.to_u64();
+            assert_eq!(self.table.hash(self.index), 0);
+            *self.table.hashes.offset(index) = hash.to_u64();
             move_val_init(&mut *self.table.keys.offset(index), key);
             move_val_init(&mut *self.table.values.offset(index), value);
         }
@@ -211,8 +322,8 @@ impl<'table,K,V> FullBucket<&'table mut Table<K,V>> {
         // and thus the self remains full.
         let index = self.index as int; // FIXME
         unsafe {
-            (transmute::<&'a mut u64, &'a mut SafeHash>(
-                &mut self.table.hashes[self.index]),
+            (transmute::<*mut u64, &'a mut SafeHash>(
+                self.table.hashes.offset(index)),
              &mut *self.table.keys.offset(index),
              &mut *self.table.values.offset(index))
         }
@@ -221,7 +332,7 @@ impl<'table,K,V> FullBucket<&'table mut Table<K,V>> {
     pub fn take(self) -> (EmptyBucketMut<'table,K,V>, K, V) {
         unsafe {
             let index = self.index as int;
-            self.table.hashes[self.index] = EMPTY_BUCKET;
+            *self.table.hashes.offset(index) = EMPTY_BUCKET;
             let keys: *K = &*self.table.keys;
             let key = ptr::read(keys.offset(index));
             let values: *V = &*self.table.values;
@@ -232,11 +343,33 @@ impl<'table,K,V> FullBucket<&'table mut Table<K,V>> {
     }
 }
 
+impl<'table,K,V> FullBucket<&'table mut Table<K,V>> {
+    pub fn to_mut_refs(self) -> (&'table mut K, &'table mut V) {
+        unsafe {
+            let FullBucket { index, table, .. } = self;
+            let index = index as int; // FIXME
+            (&mut *table.keys.offset(index),
+             &mut *table.values.offset(index))
+        }
+    }
+}
+
 impl<K,V,M:TableRef<K,V>> FullBucket<M> {
     pub fn read<'a>(&'a self) -> (&'a K, &'a V) {
         unsafe {
             let index = self.index as int; // FIXME
             let table = self.table.borrow();
+            (&*table.keys.offset(index),
+             &*table.values.offset(index))
+        }
+    }
+}
+
+impl<'table,K,V> FullBucket<&'table Table<K,V>> {
+    pub fn to_refs(self) -> (&'table K, &'table V) {
+        unsafe {
+            let FullBucket { index, table, .. } = self;
+            let index = index as int; // FIXME
             (&*table.keys.offset(index),
              &*table.values.offset(index))
         }

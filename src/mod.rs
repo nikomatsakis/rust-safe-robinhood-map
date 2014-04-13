@@ -1,9 +1,15 @@
-#![feature(globs)]
+#![feature(macro_rules, managed_boxes, default_type_params, phase, globs)]
 
+extern crate rand;
+
+use rand::Rng;
 use hit::*;
-use std::hash::Hash;
+use hit::TableRef;
+use std::cmp::{Eq, TotalEq, Equiv, max};
+use std::hash::{Hash, Hasher, sip};
 use std::iter::{range, range_inclusive};
 use std::mem::replace;
+use std::num;
 use std::ptr::RawPtr;
 
 mod hit;
@@ -122,32 +128,36 @@ fn search_hashed<K:TotalEq,V,M:TableRef<K,V>>(
     search_hashed_generic(table, hash, |k_| *k == *k_)
 }
 
-fn swap<K:TotalEq,V>(mut table: &mut Table<K,V>,
-                     hash: SafeHash,
-                     k: K,
-                     v: V)
-                     -> Option<V>
-{
-    //FIXME let potential_new_size = table.size() + 1;
-    //FIXME make_some_room(table, potential_new_size);
+enum FindOrInsertResult<'a,K,V> {
+    Found(V, FullBucketMut<'a,K,V>),
+    Inserted(FullBucketMut<'a,K,V>),
+}
 
+fn find_or_insert<'table,K:TotalEq,V>(mut table: &'table mut Table<K,V>,
+                                      hash: SafeHash,
+                                      k: K,
+                                      v: V)
+                                      -> FindOrInsertResult<'table,K,V>
+{
     for dib in range_inclusive(0u, table.size()) {
         let probe = probe(&table, hash, dib);
 
         let mut full_bucket = match hit::peek(table, probe) {
             EmptyBucket(b) => {
                 // Found a hole!
-                b.put(hash, k, v);
-                return None;
+                return Inserted(b.put(hash, k, v));
             },
             FullBucket(b) => b
         };
 
         if full_bucket.hash() == hash {
-            let (_, bucket_k, bucket_v) = full_bucket.read_mut();
-            if k == *bucket_k {
+            let matches = {
+                let (_, bucket_k, bucket_v) = full_bucket.read_mut();
+                k == *bucket_k
+            };
+            if matches {
                 // Found an existing value.
-                return Some(replace(bucket_v, v));
+                return Found(v, full_bucket);
             }
         }
 
@@ -157,8 +167,7 @@ fn swap<K:TotalEq,V>(mut table: &mut Table<K,V>,
             // Found a luckier bucket. This implies that the key does not
             // already exist in the hashtable. Just do a robin hood
             // insertion, then.
-            robin_hood(full_bucket, probe_dib, hash, k, v);
-            return None;
+            return Inserted(robin_hood(full_bucket, probe_dib, hash, k, v));
         }
 
         table = full_bucket.to_table();
@@ -168,29 +177,49 @@ fn swap<K:TotalEq,V>(mut table: &mut Table<K,V>,
     fail!("Internal HashMap error: Out of space.");
 }
 
-/// Perform robin hood bucket stealing at the given 'index'. You must
+/// Perform robin hood bucket stealing at the given 'full_bucket'. You must
 /// also pass that probe's "distance to initial bucket" so we don't have
 /// to recalculate it, as well as the total number of probes already done
 /// so we have some sort of upper bound on the number of probes to do.
 ///
+/// Returns the safe `FullBucketMut` which was passed in. It will
+/// still be full, but it will contain `(k,v)` pair rather than its
+/// original contents.
+///
 /// 'hash', 'k', and 'v' are the elements to robin hood into the hashtable.
-fn robin_hood<K:TotalEq,V>(mut full_bucket: FullBucketMut<K,V>,
-                           dib_param: uint,
-                           hash: SafeHash,
-                           k: K,
-                           v: V)
+fn robin_hood<'a,K:TotalEq,V>(mut full_bucket: FullBucketMut<'a,K,V>,
+                              dib_param: uint,
+                              hash: SafeHash,
+                              k: K,
+                              v: V)
+                              -> FullBucketMut<'a,K,V>
 {
     // Swap (hash, k, v) into `full_bucket`, but now we have to find
     // a new home for the old contents.
+    let start_index = full_bucket.index();
     let (old_hash, old_key, old_val) = swap_bucket(&mut full_bucket, hash, k, v);
 
-    for dib in range(dib_param + 1, full_bucket.table().size()) {
+    let size = {
+        let table = full_bucket.table();
+        table.size() // FIXME -- failure of region inference, it appears
+    };
+
+    for dib in range(dib_param + 1, size) {
         let (table, probe) = probe_next(full_bucket);
         match table.peek(probe) {
             EmptyBucket(b) => {
                 // Finally. A hole!
-                b.put(old_hash, old_key, old_val);
-                return;
+                let b = b.put(old_hash, old_key, old_val);
+
+                // Recover the original bucket. Assert that it is full.
+                let table = b.to_table();
+                return match table.peek(start_index) {
+                    FullBucket(b) => b,
+                    EmptyBucket(..) => {
+                        fail!("HashMap fatal error: original bucket \
+                               somehow became empty");
+                    }
+                };
             }
             FullBucket(b) => {
                 full_bucket = b;
@@ -210,7 +239,6 @@ fn robin_hood<K:TotalEq,V>(mut full_bucket: FullBucketMut<K,V>,
     fail!("HashMap fatal error: 100% load factor?");
 }
 
-
 // We use this type for the load factor, to avoid floating point operations
 // which might not be supported efficiently on some hardware.
 //
@@ -218,10 +246,9 @@ fn robin_hood<K:TotalEq,V>(mut full_bucket: FullBucketMut<K,V>,
 // to u64s when we actually use them.
 type Fraction = (u16, u16); // (numerator, denominator)
 
-pub struct HashMap<K, V> {
+pub struct HashMap<K, V, H = sip::SipHasher> {
     // All hashes are keyed on these values, to prevent hash collision attacks.
-    k0: u64,
-    k1: u64,
+    hasher: H,
 
     // When size == grow_at, we double the capacity.
     grow_at: uint,
@@ -236,11 +263,148 @@ pub struct HashMap<K, V> {
     load_factor: Fraction,
 }
 
-/*
-impl<K:Hash+Eq,V> Map<K,V> for HashMap<K,V> {
+// multiplication by a fraction, in a way that won't generally overflow for
+// array sizes outside a factor of 10 of U64_MAX.
+fn fraction_mul(lhs: uint, (num, den): Fraction) -> uint {
+    (((lhs as u64) * (num as u64)) / (den as u64)) as uint
+}
+
+/// Get the number of elements which will force the capacity to grow.
+fn grow_at(capacity: uint, load_factor: Fraction) -> uint {
+    fraction_mul(capacity, load_factor)
+}
+
+static INITIAL_LOG2_CAP: uint = 5;
+static INITIAL_CAPACITY: uint = 1 << INITIAL_LOG2_CAP; // 2^5
+static INITIAL_LOAD_FACTOR: Fraction = (9, 10);
+
+impl<K: Hash + TotalEq, V> HashMap<K, V, sip::SipHasher> {
+    /// Create an empty HashMap.
+    pub fn new() -> HashMap<K, V, sip::SipHasher> {
+        HashMap::with_capacity(INITIAL_CAPACITY)
+    }
+
+    pub fn with_capacity(capacity: uint) -> HashMap<K, V, sip::SipHasher> {
+        let mut r = rand::task_rng();
+        let r0 = r.gen();
+        let r1 = r.gen();
+        let hasher = sip::SipHasher::new_with_keys(r0, r1);
+        HashMap::with_capacity_and_hasher(capacity, hasher)
+    }
+}
+
+impl<K: TotalEq + Hash<S>, V, S, H: Hasher<S>> HashMap<K, V, H> {
+    pub fn with_hasher(hasher: H) -> HashMap<K, V, H> {
+        HashMap::with_capacity_and_hasher(INITIAL_CAPACITY, hasher)
+    }
+
+    /// Create an empty HashMap with space for at least `capacity`
+    /// elements, using `hasher` to hash the keys.
+    ///
+    /// Warning: `hasher` is normally randomly generated, and
+    /// is designed to allow HashMaps to be resistant to attacks that
+    /// cause many collisions and very poor performance. Setting it
+    /// manually using this function can expose a DoS attack vector.
+    pub fn with_capacity_and_hasher(capacity: uint, hasher: H) -> HashMap<K, V, H> {
+        let cap = num::next_power_of_two(max(INITIAL_CAPACITY, capacity));
+        HashMap {
+            hasher:           hasher,
+            load_factor:      INITIAL_LOAD_FACTOR,
+            grow_at:          grow_at(cap, INITIAL_LOAD_FACTOR),
+            minimum_capacity: cap,
+            table:            Table::new(cap),
+        }
+    }
+
+    /// Resizes the internal vectors to a new capacity. It's your responsibility to:
+    ///   1) Make sure the new capacity is enough for all the elements, accounting
+    ///      for the load factor.
+    ///   2) Ensure new_capacity is a power of two.
+    fn resize(&mut self, new_capacity: uint) {
+        assert!(self.table.size() <= new_capacity);
+        assert!((new_capacity - 1) & new_capacity == 0);
+
+        self.grow_at = grow_at(new_capacity, self.load_factor);
+
+        let old_table = replace(&mut self.table, Table::new(new_capacity));
+        let old_size  = old_table.size();
+
+        for (h, k, v) in old_table.move_iter() {
+            find_or_insert(&mut self.table, h, k, v);
+        }
+
+        assert_eq!(self.table.size(), old_size);
+    }
+
+    /// Get the number of elements which will force the capacity to shrink.
+    /// When size == self.shrink_at(), we halve the capacity.
+    fn shrink_at(&self) -> uint {
+        self.table.capacity() >> 2
+    }
+
+    /// Performs any necessary resize operations, such that there's space for
+    /// new_size elements.
+    fn make_some_room(&mut self, new_size: uint) {
+        let should_shrink = new_size <= self.shrink_at();
+        let should_grow   = self.grow_at <= new_size;
+
+        if should_grow {
+            let new_capacity = self.table.capacity() << 1;
+            self.resize(new_capacity);
+        } else if should_shrink {
+            let new_capacity = self.table.capacity() >> 1;
+
+            // Never shrink below the minimum capacity
+            if self.minimum_capacity <= new_capacity {
+                self.resize(new_capacity);
+            }
+        }
+    }
+
+    fn make_hash<X: Hash<S>>(&self, x: &X) -> SafeHash {
+        SafeHash::new(self.hasher.hash(x))
+    }
+
+    /// Search for a key, yielding the index if it's found in the hashtable.
+    /// If you already have the hash for the key lying around, use
+    /// search_hashed.
+    fn search<'a>(&'a self, k: &K) -> Option<FullBucketImm<'a,K,V>> {
+        let hash = self.make_hash(k);
+        search_hashed(&self.table, hash, k)
+    }
+
+    /// Search for a key, yielding the index if it's found in the hashtable.
+    /// If you already have the hash for the key lying around, use
+    /// search_hashed.
+    fn search_mut<'a>(&'a mut self, k: &K) -> Option<FullBucketMut<'a,K,V>> {
+        let hash = self.make_hash(k);
+        search_hashed(&mut self.table, hash, k)
+    }
+}
+
+impl<K: TotalEq + Hash<S>, V, S, H: Hasher<S>> Container for HashMap<K, V, H> {
+    /// Return the number of elements in the map
+    fn len(&self) -> uint { self.table.size() }
+}
+
+impl<K: TotalEq + Hash<S>, V, S, H: Hasher<S>> Mutable for HashMap<K, V, H> {
+    /// Clear the map, removing all key-value pairs.
+    fn clear(&mut self) {
+        self.minimum_capacity = self.table.size();
+
+        for i in range(0, self.table.capacity()) {
+            match (&mut self.table).peek(i) {
+                EmptyBucket(_) => {}
+                FullBucket(b) => { b.take(); }
+            }
+        }
+    }
+}
+
+impl<K: TotalEq + Hash<S>, V, S, H: Hasher<S>> Map<K, V> for HashMap<K, V, H> {
     fn find<'a>(&'a self, k: &K) -> Option<&'a V> {
-        self.search(k).map(|idx| {
-            let (_, v) = self.table.read(&idx);
+        self.search(k).map(|bucket: FullBucketImm<'a,K,V>| {
+            let (_, v) = bucket.to_refs();
             v
         })
     }
@@ -249,6 +413,59 @@ impl<K:Hash+Eq,V> Map<K,V> for HashMap<K,V> {
         self.search(k).is_some()
     }
 }
-*/
+
+impl<K: TotalEq + Hash<S>, V, S, H: Hasher<S>> MutableMap<K, V> for HashMap<K, V, H> {
+    fn find_mut<'a>(&'a mut self, k: &K) -> Option<&'a mut V> {
+        match self.search_mut(k) {
+            None => None,
+            Some(bucket) => {
+                let (_, v) = bucket.to_mut_refs();
+                Some(v)
+            }
+        }
+    }
+
+    fn swap(&mut self,
+            k: K,
+            v: V)
+            -> Option<V>
+    {
+        let hash = self.make_hash(&k);
+        let potential_new_size = self.table.size() + 1;
+        self.make_some_room(potential_new_size);
+        match find_or_insert(&mut self.table, hash, k, v) {
+            Found(v, mut full_bucket) => {
+                let (_, _, val_ref) = full_bucket.read_mut();
+                let old_val = replace(val_ref, v);
+                Some(old_val)
+            }
+            Inserted(_) => {
+                None
+            }
+        }
+    }
+
+    fn pop(&mut self, k: &K) -> Option<V> {
+        fail!()
+    }
+}
 
 fn main() { }
+
+#[cfg(test)]
+mod test_map {
+    use super::HashMap;
+    use std::cmp::Equiv;
+    use std::hash::Hash;
+    use std::iter::{Iterator,range_inclusive,range_step_inclusive};
+    use std::local_data;
+    use std::vec;
+
+    #[test]
+    fn test_swap() {
+        let mut m = HashMap::new();
+        assert_eq!(m.swap(1, 2), None);
+        assert_eq!(m.swap(1, 3), Some(2));
+        assert_eq!(m.swap(1, 4), Some(3));
+    }
+}
