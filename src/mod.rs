@@ -12,6 +12,8 @@ use std::default::Default;
 use std::hash::{Hash, Hasher, sip};
 use std::iter;
 use std::iter::{range, range_inclusive};
+use std::fmt;
+use std::fmt::Show;
 use std::mem::replace;
 use std::num;
 use std::ptr::RawPtr;
@@ -512,6 +514,17 @@ impl<K: TotalEq + Hash<S>, V, S, H: Hasher<S>> HashMap<K, V, H> {
         pop_internal(starting_bucket)
     }
 
+    /// Return the value corresponding to the key in the map, using
+    /// equivalence.
+    pub fn find_equiv<'a, Q:Hash<S>+Equiv<K>>(&'a self, k: &Q) -> Option<&'a V> {
+        match self.search_equiv(k) {
+            None => None,
+            Some(fb) => {
+                Some(fb.to_refs().val1())
+            }
+        }
+    }
+
     /// An iterator visiting all keys in arbitrary order.
     /// Iterator element type is &'a K.
     pub fn keys<'a>(&'a self) -> Keys<'a, K, V> {
@@ -635,6 +648,32 @@ impl<'table, K, V> Iterator<(&'table K, &'table V)> for Entries<'table, K, V> {
     fn size_hint(&self) -> (uint, Option<uint>) {
         let size = self.table.size() - self.index;
         (size, Some(size))
+    }
+}
+
+impl<K:TotalEq+Hash<S>,V:Eq,S,H:Hasher<S>> Eq for HashMap<K, V, H> {
+    fn eq(&self, other: &HashMap<K, V, H>) -> bool {
+        if self.len() != other.len() { return false; }
+
+        self.iter().all(|(key, value)| {
+            match other.find(key) {
+                None    => false,
+                Some(v) => *value == *v
+            }
+        })
+    }
+}
+
+impl<K:TotalEq+Hash<S>+Show,V:Show,S,H:Hasher<S>> Show for HashMap<K, V, H> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        try!(write!(f.buf, r"\{"));
+
+        for (i, (k, v)) in self.iter().enumerate() {
+            if i != 0 { try!(write!(f.buf, ", ")); }
+            try!(write!(f.buf, "{}: {}", *k, *v));
+        }
+
+        write!(f.buf, r"\}")
     }
 }
 
