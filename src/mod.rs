@@ -50,9 +50,9 @@ fn probe<K,V,M:TableRef<K,V>>(table: &M, hash: SafeHash, idx: uint) -> uint {
 
 // Generate the next probe in a sequence. Prefer to use 'probe' by itself,
 // but this can sometimes be useful.
-fn probe_next<K,V,M:TableRef<K,V>>(full_bucket: FullBucket<M>) -> (M, uint) {
-    let probe = full_bucket.index();
-    let table = full_bucket.to_table();
+fn probe_next<K,V,M:TableRef<K,V>,B:Bucket<M>>(bucket: B) -> (M, uint) {
+    let probe = bucket.index();
+    let table = bucket.to_table();
     let hash_mask = table.capacity() - 1;
     (table, (probe + 1) & hash_mask)
 }
@@ -73,6 +73,26 @@ fn bucket_distance<K,V,M:TableRef<K,V>>(bucket: &FullBucket<M>) -> uint {
     } else {
         // probe wrapped around the hashtable
         raw_index + (bucket.table().capacity() - first_probe_index)
+    }
+}
+
+fn expect_full<K,V,M:TableRef<K,V>>(table: M, index: uint) -> FullBucket<M> {
+    match table.peek(index) {
+        FullBucket(b) => b,
+        EmptyBucket(..) => {
+            fail!("Bucket which should have been full is empty");
+        }
+    }
+}
+
+fn expect_empty<K,V,M:TableRef<K,V>>(table: M, index: uint) -> EmptyBucket<M> {
+    match table.peek(index) {
+        FullBucket(_) => {
+            fail!("Bucket which should have been empty is full");
+        }
+        EmptyBucket(eb) => {
+            eb
+        }
     }
 }
 
@@ -177,6 +197,74 @@ fn find_or_insert<'table,K:TotalEq,V>(mut table: &'table mut Table<K,V>,
     fail!("Internal HashMap error: Out of space.");
 }
 
+fn pop_internal<K:TotalEq,V>(starting_bucket: FullBucketMut<K,V>)
+                             -> Option<V>
+{
+    // Key idea: If we remove bucket B, then it's possible that the
+    // data in bucket (B+1) would have preferred to be in B, in which
+    // case we have to shift it down. Moreover, there is a trickle
+    // down effect: if we do shift from B+1 to B, then by the same logic
+    // the data in B+2 might have preferred to be in B+1.
+    //
+    // So, in general, we have to continue shifting down until we reach
+    // either an empty bucket, or a bucket that is exactly where it wants
+    // to be (i.e., the Distance to Ideal Bucket is zero).
+
+    // Empty the initial gap. Remember this return value; we'll want
+    // to return it at the end.
+    let (mut gap, _, retval) = starting_bucket.take();
+
+    // We'll shift at most size items:
+    let size = {
+        let table = gap.table(); // FIXME lifetime too short, what?
+        table.size()
+    };
+    for _ in range(0u, size) {
+        // Check whether index `gap+1` is occupied by a value that
+        // would have preferred to be in index `gap`:
+        let gap_index = gap.index();
+        let (table, succ) = probe_next(gap);
+        match table.peek(succ) {
+            EmptyBucket(_) => {
+                // Bucket after gap is empty. All done.
+                break;
+            }
+
+            FullBucket(succ) => {
+                // Bucket after gap is full.
+
+                if bucket_distance(&succ) == 0 {
+                    // This data is exactly where it wants to be. All done.
+                    break;
+                }
+
+                gap = shift(gap_index, succ);
+            }
+        }
+    }
+
+    // Now we're done all our shifting. Return the value we grabbed
+    // earlier.
+    return Some(retval);
+
+    fn shift<'table,K,V>(gap_index: uint,
+                         succ: FullBucketMut<'table,K,V>)
+                         -> EmptyBucketMut<'table,K,V>
+    {
+        /*!
+         * Moves data from `fb` into `gap_index`, which should be an
+         * empty entry. Returns the (now empty) bucket for `fb`.
+         */
+
+        let succ_index = succ.index();
+        let succ_hash = succ.hash();
+        let (succ, succ_key, succ_value) = succ.take();
+        let gap = expect_empty(succ.to_table(), gap_index);
+        let table = gap.put(succ_hash, succ_key, succ_value).to_table();
+        expect_empty(table, succ_index)
+    }
+}
+
 /// Perform robin hood bucket stealing at the given 'full_bucket'. You must
 /// also pass that probe's "distance to initial bucket" so we don't have
 /// to recalculate it, as well as the total number of probes already done
@@ -213,13 +301,7 @@ fn robin_hood<'a,K:TotalEq,V>(mut full_bucket: FullBucketMut<'a,K,V>,
 
                 // Recover the original bucket. Assert that it is full.
                 let table = b.to_table();
-                return match table.peek(start_index) {
-                    FullBucket(b) => b,
-                    EmptyBucket(..) => {
-                        fail!("HashMap fatal error: original bucket \
-                               somehow became empty");
-                    }
-                };
+                return expect_full(table, start_index);
             }
             FullBucket(b) => {
                 full_bucket = b;
@@ -425,11 +507,7 @@ impl<K: TotalEq + Hash<S>, V, S, H: Hasher<S>> MutableMap<K, V> for HashMap<K, V
         }
     }
 
-    fn swap(&mut self,
-            k: K,
-            v: V)
-            -> Option<V>
-    {
+    fn swap(&mut self, k: K, v: V) -> Option<V> {
         let hash = self.make_hash(&k);
         let potential_new_size = self.table.size() + 1;
         self.make_some_room(potential_new_size);
@@ -446,26 +524,21 @@ impl<K: TotalEq + Hash<S>, V, S, H: Hasher<S>> MutableMap<K, V> for HashMap<K, V
     }
 
     fn pop(&mut self, k: &K) -> Option<V> {
-        fail!()
+        if self.table.size() == 0 {
+            return None
+        }
+
+        let potential_new_size = self.table.size() - 1;
+        self.make_some_room(potential_new_size);
+
+        match self.search_mut(k) {
+            Some(b) => pop_internal(b),
+            None  => None
+        }
     }
 }
 
 fn main() { }
 
 #[cfg(test)]
-mod test_map {
-    use super::HashMap;
-    use std::cmp::Equiv;
-    use std::hash::Hash;
-    use std::iter::{Iterator,range_inclusive,range_step_inclusive};
-    use std::local_data;
-    use std::vec;
-
-    #[test]
-    fn test_swap() {
-        let mut m = HashMap::new();
-        assert_eq!(m.swap(1, 2), None);
-        assert_eq!(m.swap(1, 3), Some(2));
-        assert_eq!(m.swap(1, 4), Some(3));
-    }
-}
+mod test_map;

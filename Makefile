@@ -1,5 +1,7 @@
-all:
-	rustc --test src/mod.rs
+all: test-map
 
-test: all
-	./mod
+test-map: $(wildcard src/*.rs)
+	rustc --test src/mod.rs -g -o test-map
+
+test: test-map
+	./test-map

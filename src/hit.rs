@@ -24,9 +24,11 @@
  * table reference.
  */
 
+extern crate libc;
 use std::intrinsics::{size_of, transmute, move_val_init};
 use std::ptr;
 use std::rt::global_heap;
+use std::iter::{range_step_inclusive};
 
 pub struct Table<K,V> {
     capacity: uint,
@@ -39,6 +41,11 @@ pub struct Table<K,V> {
 pub enum BucketState<M> {
     EmptyBucket(EmptyBucket<M>),
     FullBucket(FullBucket<M>),
+}
+
+pub trait Bucket<M> {
+    fn to_table(self) -> M;
+    fn index(&self) -> uint;
 }
 
 pub struct EmptyBucket<M> {
@@ -70,7 +77,7 @@ pub trait TableRef<K,V> {
     }
 
     fn hash(&self, index: uint) -> u64 {
-        assert!(index < self.size());
+        assert!(index < self.capacity());
         unsafe {
             *self.borrow().hashes.offset(index as int)
         }
@@ -122,24 +129,12 @@ pub type EmptyBucketMut<'table,K,V> = EmptyBucket<&'table mut Table<K,V>>;
 pub type FullBucketMut<'table,K,V> = FullBucket<&'table mut Table<K,V>>;
 
 impl<K,V,M:TableRef<K,V>> EmptyBucket<M> {
-    pub fn to_table(self) -> M {
-        self.table
-    }
-
     pub fn table<'a>(&'a self) -> &'a M {
         &self.table
     }
 }
 
 impl<K,V,M:TableRef<K,V>> FullBucket<M> {
-    pub fn index(&self) -> uint {
-        self.index
-    }
-
-    pub fn hash(&self) -> SafeHash {
-        self.hash
-    }
-
     pub fn freeze<'a>(&'a self) -> FullBucketImm<'a,K,V> {
         FullBucket {
             table: self.table.borrow(),
@@ -148,12 +143,32 @@ impl<K,V,M:TableRef<K,V>> FullBucket<M> {
         }
     }
 
-    pub fn to_table(self) -> M {
+    pub fn table<'a>(&'a self) -> &'a M {
+        &self.table
+    }
+
+    pub fn hash(&self) -> SafeHash {
+        self.hash
+    }
+}
+
+impl<M> Bucket<M> for EmptyBucket<M> {
+    fn to_table(self) -> M {
         self.table
     }
 
-    pub fn table<'a>(&'a self) -> &'a M {
-        &self.table
+    fn index(&self) -> uint {
+        self.index
+    }
+}
+
+impl<M> Bucket<M> for FullBucket<M> {
+    fn to_table(self) -> M {
+        self.table
+    }
+
+    fn index(&self) -> uint {
+        self.index
     }
 }
 
@@ -255,6 +270,34 @@ impl<K,V,M:TableRef<K,V>> HitOps for M {
         } else {
             FullBucket(FullBucket { table: self, index: index,
                                     hash: SafeHash { hash: hash } })
+        }
+    }
+}
+
+#[unsafe_destructor]
+impl<K, V> Drop for Table<K, V> {
+    fn drop(&mut self) {
+        // Ideally, this should be in reverse, since we're likely to have
+        // partially taken some elements out with `.move_iter()` from the
+        // front.
+        for i in range_step_inclusive(self.capacity as int - 1, 0, -1) {
+            // Check if the size is 0, so we don't do a useless scan when
+            // dropping empty tables such as on resize.
+
+            if self.size == 0 { break }
+
+            match self.peek(i as uint) {
+                EmptyBucket(eb)  => {},
+                FullBucket(fb) => { fb.take(); }
+            }
+        }
+
+        assert!(self.size == 0);
+
+        unsafe {
+            libc::free(self.values as *mut libc::c_void);
+            libc::free(self.keys   as *mut libc::c_void);
+            libc::free(self.hashes as *mut libc::c_void);
         }
     }
 }
