@@ -16,12 +16,14 @@ test hashmap::bench::hashmap_as_queue             ... bench:       189 ns/iter (
 test hashmap::bench::insert                       ... bench:       224 ns/iter (+/- 19)
 ```
 
-but my version yields:
+My version yields:
 
 ```
-test bench::find_existing    ... bench:        68 ns/iter (+/- 5)
-test bench::find_nonexisting ... bench:        63 ns/iter (+/- 11)
-test bench::find_pop_insert  ... bench:       355 ns/iter (+/- 7)
-test bench::hashmap_as_queue ... bench:       210 ns/iter (+/- 4)
-test bench::insert           ... bench:       238 ns/iter (+/- 10)
+test bench::find_existing    ... bench:        67 ns/iter (+/- 7)
+test bench::find_nonexisting ... bench:        62 ns/iter (+/- 8)
+test bench::find_pop_insert  ... bench:       350 ns/iter (+/- 11)
+test bench::hashmap_as_queue ... bench:       208 ns/iter (+/- 3)
+test bench::insert           ... bench:       227 ns/iter (+/- 8)
 ```
+
+As you can see, the two are pretty close.

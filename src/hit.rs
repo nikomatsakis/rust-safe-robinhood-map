@@ -73,6 +73,7 @@ pub enum BucketState<M> {
 }
 
 pub trait Bucket<M> {
+    fn table<'a>(&'a self) -> &'a M;
     fn to_table(self) -> M;
     fn index(&self) -> uint;
 }
@@ -86,6 +87,25 @@ pub struct FullBucket<M> {
     table: M,
     index: uint,
     hash: SafeHash,
+}
+
+/**
+ * A Gap represents the state of two buckets at once. The first bucket
+ * is known to be empty, and the second bucket may be empty or may not
+ * be. See `GapState` as the means to test that. You can construct a
+ * `Gap` by invoking `peek_gap()` on an empty bucket.
+ */
+pub struct Gap<B> {
+    /** Index of the gap (known to be empty) */
+    gap: uint,
+
+    /** State of the second bucket (maybe empty, maybe not) */
+    bucket: B
+}
+
+pub enum GapState<M> {
+    GapThenEmpty(Gap<EmptyBucket<M>>),
+    GapThenFull(Gap<FullBucket<M>>),
 }
 
 ///////////////////////////////////////////////////////////////////////////
@@ -158,8 +178,13 @@ pub type EmptyBucketMut<'table,K,V> = EmptyBucket<&'table mut Table<K,V>>;
 pub type FullBucketMut<'table,K,V> = FullBucket<&'table mut Table<K,V>>;
 
 impl<K,V,M:TableRef<K,V>> EmptyBucket<M> {
-    pub fn table<'a>(&'a self) -> &'a M {
-        &self.table
+    pub fn peek_gap(self, next_index: uint) -> GapState<M> {
+        let index = self.index;
+        let table = self.to_table();
+        match table.peek(next_index) {
+            EmptyBucket(eb) => GapThenEmpty(Gap { gap: index, bucket: eb }),
+            FullBucket(fb) => GapThenFull(Gap { gap: index, bucket: fb }),
+        }
     }
 }
 
@@ -172,16 +197,16 @@ impl<K,V,M:TableRef<K,V>> FullBucket<M> {
         }
     }
 
-    pub fn table<'a>(&'a self) -> &'a M {
-        &self.table
-    }
-
     pub fn hash(&self) -> SafeHash {
         self.hash
     }
 }
 
 impl<M> Bucket<M> for EmptyBucket<M> {
+    fn table<'a>(&'a self) -> &'a M {
+        &self.table
+    }
+
     fn to_table(self) -> M {
         self.table
     }
@@ -192,12 +217,37 @@ impl<M> Bucket<M> for EmptyBucket<M> {
 }
 
 impl<M> Bucket<M> for FullBucket<M> {
+    fn table<'a>(&'a self) -> &'a M {
+        &self.table
+    }
+
     fn to_table(self) -> M {
         self.table
     }
 
     fn index(&self) -> uint {
         self.index
+    }
+}
+
+//////////////////////////////////////////////////////////////////////////
+// A Gap represents the state of two buckets at once. The first bucket,
+// called the gap, is known to be empty. The second bucket, stored
+// in the field `bucket`, may be empty or full.
+
+impl<B> Gap<B> {
+    pub fn bucket<'a>(&'a self) -> &'a B {
+        &self.bucket
+    }
+}
+
+impl<'a,K,V> Gap<FullBucket<&'a mut Table<K,V>>> {
+    pub fn shift(self) -> EmptyBucket<&'a mut Table<K,V>> {
+        let old_gap = self.gap;
+        let hash = self.bucket.hash;
+        let (new_gap, k, v) = self.bucket.take();
+        new_gap.table.put(old_gap, hash, k, v);
+        new_gap
     }
 }
 
@@ -275,6 +325,25 @@ impl<K,V> Table<K,V> {
 
     pub fn capacity(&self) -> uint {
         self.borrow().capacity
+    }
+
+    fn put(&mut self, index: uint, hash: SafeHash, key: K, value: V) {
+        /*!
+         * Overwrites the entry at `index`, which must be an empty
+         * bucket. Note that this function is NOT public -- the public
+         * version is exposed on EmptyBucket.
+         */
+
+        // Statically guaranteed, only needed in DEBUG builds:
+        assert_eq!(self.hash(index), 0);
+
+        let iindex = index as int; // FIXME
+        unsafe {
+            *self.hashes.offset(iindex) = hash.to_u64();
+            move_val_init(&mut *self.keys.offset(iindex), key);
+            move_val_init(&mut *self.values.offset(iindex), value);
+        }
+        self.size += 1;
     }
 }
 
@@ -402,14 +471,7 @@ impl<'table,K,V> EmptyBucket<&'table mut Table<K,V>> {
     pub fn put(self, hash: SafeHash, key: K, value: V)
                -> FullBucketMut<'table,K,V>
     {
-        let index = self.index as int; // FIXME
-        unsafe {
-            assert_eq!(self.table.hash(self.index), 0);
-            *self.table.hashes.offset(index) = hash.to_u64();
-            move_val_init(&mut *self.table.keys.offset(index), key);
-            move_val_init(&mut *self.table.values.offset(index), value);
-        }
-        self.table.size += 1;
+        self.table.put(self.index, hash, key, value);
         FullBucket { index: self.index, hash: hash, table: self.table }
     }
 }

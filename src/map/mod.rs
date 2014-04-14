@@ -6,7 +6,7 @@ extern crate rand;
 use hit;
 use hit::{SafeHash,Bucket,Table,TableRef,EmptyBucket,FullBucket,
           FullBucketMut,FullBucketImm,EmptyBucketMut,EmptyBucketImm,
-          peek,HitOps};
+          peek,HitOps,BucketState,GapThenEmpty,GapThenFull};
 use hit::TableRef;
 use self::rand::Rng;
 use std::cmp::{Eq, TotalEq, Equiv, max};
@@ -447,13 +447,19 @@ fn probe<K,V,M:TableRef<K,V>>(table: &M, hash: SafeHash, idx: uint) -> uint {
     ((hash.to_u64() as uint) + idx) & hash_mask
 }
 
-// Generate the next probe in a sequence. Prefer to use 'probe' by itself,
-// but this can sometimes be useful.
-fn probe_next<K,V,M:TableRef<K,V>,B:Bucket<M>>(bucket: B) -> (M, uint) {
+// Generate the next probe index in a sequence. Prefer to use 'probe'
+// by itself, but this can sometimes be useful.
+fn next_probe_index<K,V,M:TableRef<K,V>,B:Bucket<M>>(bucket: &B) -> (uint) {
     let probe = bucket.index();
-    let table = bucket.to_table();
+    let table = bucket.table();
     let hash_mask = table.capacity() - 1;
-    (table, (probe + 1) & hash_mask)
+    (probe + 1) & hash_mask
+}
+
+// Probes the state of the next bucket in the sequence.
+fn probe_next<K,V,M:TableRef<K,V>,B:Bucket<M>>(bucket: B) -> BucketState<M> {
+    let index = next_probe_index(&bucket);
+    bucket.to_table().peek(index)
 }
 
 /// Get the distance of the bucket at the given index that it lies
@@ -621,23 +627,22 @@ fn pop_internal<K:TotalEq,V>(starting_bucket: FullBucketMut<K,V>)
     for _ in range(0u, size) {
         // Check whether index `gap+1` is occupied by a value that
         // would have preferred to be in index `gap`:
-        let gap_index = gap.index();
-        let (table, succ) = probe_next(gap);
-        match table.peek(succ) {
-            EmptyBucket(_) => {
+        let next_index = next_probe_index(&gap);
+        match gap.peek_gap(next_index) {
+            GapThenEmpty(_) => {
                 // Bucket after gap is empty. All done.
                 break;
             }
 
-            FullBucket(succ) => {
+            GapThenFull(succ) => {
                 // Bucket after gap is full.
 
-                if bucket_distance(&succ) == 0 {
+                if bucket_distance(succ.bucket()) == 0 {
                     // This data is exactly where it wants to be. All done.
                     break;
                 }
 
-                gap = shift(gap_index, succ);
+                gap = succ.shift();
             }
         }
     }
@@ -645,23 +650,6 @@ fn pop_internal<K:TotalEq,V>(starting_bucket: FullBucketMut<K,V>)
     // Now we're done all our shifting. Return the value we grabbed
     // earlier.
     return Some(retval);
-
-    fn shift<'table,K,V>(gap_index: uint,
-                         succ: FullBucketMut<'table,K,V>)
-                         -> EmptyBucketMut<'table,K,V>
-    {
-        /*!
-         * Moves data from `fb` into `gap_index`, which should be an
-         * empty entry. Returns the (now empty) bucket for `fb`.
-         */
-
-        let succ_index = succ.index();
-        let succ_hash = succ.hash();
-        let (succ, succ_key, succ_value) = succ.take();
-        let gap = expect_empty(succ.to_table(), gap_index);
-        let table = gap.put(succ_hash, succ_key, succ_value).to_table();
-        expect_empty(table, succ_index)
-    }
 }
 
 /// Perform robin hood bucket stealing at the given 'full_bucket'. You must
@@ -692,8 +680,7 @@ fn robin_hood<'a,K:TotalEq,V>(mut full_bucket: FullBucketMut<'a,K,V>,
     };
 
     for dib in range(dib_param + 1, size) {
-        let (table, probe) = probe_next(full_bucket);
-        match table.peek(probe) {
+        match probe_next(full_bucket) {
             EmptyBucket(b) => {
                 // Finally. A hole!
                 let b = b.put(old_hash, old_key, old_val);
