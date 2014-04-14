@@ -3,10 +3,14 @@
 extern crate rand;
 
 use rand::Rng;
-use hit::*;
+use hit::{SafeHash,Bucket,Table,TableRef,EmptyBucket,FullBucket,
+          FullBucketMut,FullBucketImm,EmptyBucketMut,EmptyBucketImm,
+          peek,HitOps};
 use hit::TableRef;
 use std::cmp::{Eq, TotalEq, Equiv, max};
+use std::default::Default;
 use std::hash::{Hash, Hasher, sip};
+use std::iter;
 use std::iter::{range, range_inclusive};
 use std::mem::replace;
 use std::num;
@@ -345,6 +349,14 @@ pub struct HashMap<K, V, H = sip::SipHasher> {
     load_factor: Fraction,
 }
 
+/// HashMap move iterator
+pub type MoveEntries<K, V> =
+    iter::Map<'static, (SafeHash, K, V), (K, V), hit::MoveEntries<K, V>>;
+
+/// HashMap keys iterator
+pub type Keys<'a, K, V> =
+    iter::Map<'static, (&'a K, &'a V), &'a K, Entries<'a, K, V>>;
+
 // multiplication by a fraction, in a way that won't generally overflow for
 // array sizes outside a factor of 10 of U64_MAX.
 fn fraction_mul(lhs: uint, (num, den): Fraction) -> uint {
@@ -455,12 +467,64 @@ impl<K: TotalEq + Hash<S>, V, S, H: Hasher<S>> HashMap<K, V, H> {
         search_hashed(&self.table, hash, k)
     }
 
+    fn search_equiv<'a,Q:Hash<S>+Equiv<K>>(&'a self,
+                                           q: &Q)
+                                           -> Option<FullBucketImm<'a,K,V>>
+    {
+        search_hashed_generic(&self.table, self.make_hash(q), |k| q.equiv(k))
+    }
+
+    fn search_mut_equiv<'a,Q:Hash<S>+Equiv<K>>(&'a mut self,
+                                               q: &Q)
+                                               -> Option<FullBucketMut<'a,K,V>>
+    {
+        let hash = self.make_hash(q);
+        search_hashed_generic(&mut self.table, hash, |k| q.equiv(k))
+    }
+
     /// Search for a key, yielding the index if it's found in the hashtable.
     /// If you already have the hash for the key lying around, use
     /// search_hashed.
     fn search_mut<'a>(&'a mut self, k: &K) -> Option<FullBucketMut<'a,K,V>> {
         let hash = self.make_hash(k);
         search_hashed(&mut self.table, hash, k)
+    }
+
+    /// Like `pop`, but can operate on any type that is equivalent to a key.
+    #[experimental]
+    pub fn pop_equiv<Q:Hash<S> + Equiv<K>>(&mut self, k: &Q) -> Option<V> {
+        if self.table.size() == 0 {
+            return None
+        }
+
+        let potential_new_size = self.table.size() - 1;
+        self.make_some_room(potential_new_size);
+
+        let starting_bucket = match self.search_mut_equiv(k) {
+            Some(fb) => fb,
+            None      => return None,
+        };
+
+        pop_internal(starting_bucket)
+    }
+
+    /// An iterator visiting all keys in arbitrary order.
+    /// Iterator element type is &'a K.
+    pub fn keys<'a>(&'a self) -> Keys<'a, K, V> {
+        self.iter().map(|(k, _v)| k)
+    }
+
+    /// An iterator visiting all key-value pairs in arbitrary order.
+    /// Iterator element type is (&'a K, &'a V).
+    pub fn iter<'a>(&'a self) -> Entries<'a, K, V> {
+        Entries { table: &self.table, index: 0 }
+    }
+
+    /// Creates a consuming iterator, that is, one that moves each key-value
+    /// pair out of the map in arbitrary order. The map cannot be used after
+    /// calling this.
+    pub fn move_iter(self) -> MoveEntries<K, V> {
+        self.table.move_iter().map(|(_, k, v)| (k, v))
     }
 }
 
@@ -534,6 +598,49 @@ impl<K: TotalEq + Hash<S>, V, S, H: Hasher<S>> MutableMap<K, V> for HashMap<K, V
         match self.search_mut(k) {
             Some(b) => pop_internal(b),
             None  => None
+        }
+    }
+}
+
+pub struct Entries<'table, K, V> {
+    table: &'table Table<K, V>,
+    index: uint,
+}
+
+impl<'table, K, V> Iterator<(&'table K, &'table V)> for Entries<'table, K, V> {
+    fn next(&mut self) -> Option<(&'table K, &'table V)> {
+        while self.index < self.table.capacity() {
+            let i = self.index;
+            self.index += 1;
+
+            match self.table.peek(i) {
+                EmptyBucket(_)  => {},
+                FullBucket(fb) => return Some(fb.to_refs())
+            }
+        }
+
+        None
+    }
+
+    fn size_hint(&self) -> (uint, Option<uint>) {
+        let size = self.table.size() - self.index;
+        (size, Some(size))
+    }
+}
+
+impl<K:TotalEq+Hash<S>,V,S,H:Hasher<S>+Default> FromIterator<(K, V)> for HashMap<K, V, H> {
+    fn from_iter<T:Iterator<(K,V)>>(iter: T) -> HashMap<K, V, H> {
+        let (lower, _) = iter.size_hint();
+        let mut map = HashMap::with_capacity_and_hasher(lower, Default::default());
+        map.extend(iter);
+        map
+    }
+}
+
+impl<K:TotalEq+Hash<S>,V,S,H:Hasher<S>+Default> Extendable<(K, V)> for HashMap<K, V, H> {
+    fn extend<T:Iterator<(K,V)>>(&mut self, mut iter: T) {
+        for (k, v) in iter {
+            self.insert(k, v);
         }
     }
 }
