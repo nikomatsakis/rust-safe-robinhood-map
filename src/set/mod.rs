@@ -13,6 +13,8 @@ use std::iter;
 use std::iter::{FilterMap, Chain, Repeat, Zip};
 use std::hash::{Hash, Hasher, sip};
 
+mod test;
+
 /// HashSet iterator
 pub type SetItems<'a, K> =
     iter::Map<'static, (&'a K, &'a ()), &'a K, Entries<'a, K, ()>>;

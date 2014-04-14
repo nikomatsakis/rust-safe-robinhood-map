@@ -20,7 +20,7 @@ use std::mem::replace;
 use std::num;
 use std::ptr::RawPtr;
 
-mod test_map;
+mod test;
 
 #[deriving(Clone)]
 pub struct HashMap<K, V, H = sip::SipHasher> {

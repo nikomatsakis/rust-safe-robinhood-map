@@ -8,8 +8,9 @@ pub use map::INITIAL_CAPACITY;
 
 mod bench;
 mod hit;
-mod map;
-mod set;
 
-fn main() { }
+#[path = "map/mod.rs"]
+mod map;
+
+mod set;
 
