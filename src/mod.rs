@@ -357,6 +357,10 @@ pub type MoveEntries<K, V> =
 pub type Keys<'a, K, V> =
     iter::Map<'static, (&'a K, &'a V), &'a K, Entries<'a, K, V>>;
 
+/// HashMap values iterator
+pub type Values<'a, K, V> =
+    iter::Map<'static, (&'a K, &'a V), &'a V, Entries<'a, K, V>>;
+
 // multiplication by a fraction, in a way that won't generally overflow for
 // array sizes outside a factor of 10 of U64_MAX.
 fn fraction_mul(lhs: uint, (num, den): Fraction) -> uint {
@@ -512,6 +516,12 @@ impl<K: TotalEq + Hash<S>, V, S, H: Hasher<S>> HashMap<K, V, H> {
     /// Iterator element type is &'a K.
     pub fn keys<'a>(&'a self) -> Keys<'a, K, V> {
         self.iter().map(|(k, _v)| k)
+    }
+
+    /// An iterator visiting all values in arbitrary order.
+    /// Iterator element type is &'a V.
+    pub fn values<'a>(&'a self) -> Values<'a, K, V> {
+        self.iter().map(|(_k, v)| v)
     }
 
     /// An iterator visiting all key-value pairs in arbitrary order.
