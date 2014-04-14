@@ -5,3 +5,6 @@ test-map: $(wildcard src/*.rs)
 
 test: test-map
 	./test-map
+
+bench: test-map
+	./test-map --bench

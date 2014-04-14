@@ -7,21 +7,50 @@
  * initialized if hashes are non-zero. The external interface offered
  * by this module maintains that invariant at all times.
  *
- * The key idea is that you start out with a `Table`. You can `peek` at
- * this table to examine the state of a particular bucket. In so doing,
- * you *surrender* your reference to the table and get back a `BucketState`.
- * This `BucketState` can be either an `EmptyBucket` (indicating a spot in
- * the table that has no key/value) or a `FullBucket` (indicating a spot in
- * the table that has been initialized).
+ * The exported interface is based around threading the table pointer
+ * around. You start out with a `&Table` or `&mut Table`. You can call
+ * `peek()` with either kind of reference to examine the state of a
+ * particular bucket. In so doing, you *surrender* your reference to
+ * the table and get back a `BucketState` which encapsulates it. This
+ * `BucketState` can be either an `EmptyBucket` (indicating a spot in
+ * the table that has no key/value) or a `FullBucket` (indicating a
+ * spot in the table that has been initialized).
  *
- * The key point is that the `BucketState` *encapsulates* the table
- * reference you provided initially. This prevents you from modifying
- * the table, which ensures that the bucket state remains accurate.
- * Any further operations you would like to do, such as modifying the
- * state of the bucket, are done on the `BucketState` itself.
+ * By encapsulating the table reference you provided, the
+ * `BucketState` is able to prevent you from modifying the table,
+ * which ensures that the bucket state remains accurate.  Any further
+ * operations you would like to do, such as modifying the state of the
+ * bucket, are done on the `BucketState` itself.
  *
- * Finally, you can surrender a `BucketState` and get back the raw
- * table reference.
+ * Operations on the bucket state fall into three categories:
+ *
+ * 1. *Borrowing operations* like `read()` or `read_mut()` cannot change
+ *    the state of a bucket. These operations are defined to borrow
+ *    the bucket state itself.
+ * 2. *Updating operations* change the state of a bucket (e.g., `EmptyBucket`
+ *    offers a `put()` method that will change the bucket from empty to full).
+ *    These methods consume a bucket state and return a new one.
+ * 3. *Concluding operations* give up the bucket's hold on the table.
+ *    For example, `to_table()` consumes the bucket and yields back the
+ *    original table reference, and `to_refs()` and `to_mut_refs()`
+ *    consume the bucket and yield back pointers into the table.
+ *
+ * It is important to clarify what invariants the HIT inferface guarantees:
+ * - No unininitialized memory will be accessed in any way.
+ * - Given a `EmptyBucket`, the corresponding index in the table will
+ *   always have a hash of 0 and the entries in the key/value arrays
+ *   will be considered uninitialized (and hence cannot be accessed).
+ * - Given a `FullBucket`, the corresponding index in the table will
+ *   always have a non-zero hash and the entries in the key/value arrays
+ *   will thus be initialized to valid keys/values.
+ *
+ * The HIT *DOES NOT* make any kind of extended guarantees about the placement
+ * of keys and values:
+ * - In particular, no guarantee is made that the hash of a key is equal
+ *   to the hash in the hash array, or that the index of a key correctly
+ *   corresponds with its hash. Ensuring such things is the job of
+ *   the user of the HIT (a Robin Hood hash, in particular, has rather stringent
+ *   invariants it must maintain.)
  */
 
 extern crate libc;
@@ -303,7 +332,38 @@ impl<K, V> Drop for Table<K, V> {
 }
 
 ///////////////////////////////////////////////////////////////////////////
-//
+// clone() -- this cannot be implemented as efficiently from the outside,
+// because we'd have to at least initialize the destination hash array.
+
+impl<K:Clone,V:Clone> Clone for Table<K,V> {
+    fn clone(&self) -> Table<K,V> {
+        unsafe {
+            let mut new_ht = Table::new_uninitialized(self.capacity());
+
+            for i in range(0, self.capacity()) {
+                match self.peek(i) {
+                    EmptyBucket(eb)  => {
+                        *new_ht.hashes.offset(i as int) = EMPTY_BUCKET;
+                    },
+                    FullBucket(fb) => {
+                        let hash = fb.hash().to_u64();
+                        let (k, v) = fb.read();
+                        *new_ht.hashes.offset(i as int) = hash;
+                        move_val_init(&mut *new_ht.keys.offset(i as int), (*k).clone());
+                        move_val_init(&mut *new_ht.values.offset(i as int), (*v).clone());
+                    }
+                }
+            }
+
+            new_ht.size = self.size();
+
+            new_ht
+        }
+    }
+}
+
+///////////////////////////////////////////////////////////////////////////
+// move_iter() [cannot be implemented safely in an equally efficient way]
 
 pub struct MoveEntries<K, V> {
     table: Table<K, V>,
@@ -386,17 +446,6 @@ impl<'table,K,V> FullBucket<&'table mut Table<K,V>> {
     }
 }
 
-impl<'table,K,V> FullBucket<&'table mut Table<K,V>> {
-    pub fn to_mut_refs(self) -> (&'table mut K, &'table mut V) {
-        unsafe {
-            let FullBucket { index, table, .. } = self;
-            let index = index as int; // FIXME
-            (&mut *table.keys.offset(index),
-             &mut *table.values.offset(index))
-        }
-    }
-}
-
 impl<K,V,M:TableRef<K,V>> FullBucket<M> {
     pub fn read<'a>(&'a self) -> (&'a K, &'a V) {
         unsafe {
@@ -410,11 +459,38 @@ impl<K,V,M:TableRef<K,V>> FullBucket<M> {
 
 impl<'table,K,V> FullBucket<&'table Table<K,V>> {
     pub fn to_refs(self) -> (&'table K, &'table V) {
+        /*!
+         * Exchange a bucket state for immutable references into the
+         * table. Because the underlying reference to the table is
+         * also consumed, no further changes to the structure of the
+         * table are possible; in exchange for this, the returned
+         * references have a longer lifetime than the references
+         * returned by `read()`.
+         */
         unsafe {
             let FullBucket { index, table, .. } = self;
             let index = index as int; // FIXME
             (&*table.keys.offset(index),
              &*table.values.offset(index))
+        }
+    }
+}
+
+impl<'table,K,V> FullBucket<&'table mut Table<K,V>> {
+    pub fn to_mut_refs(self) -> (&'table mut K, &'table mut V) {
+        /*!
+         * Exchange a bucket state for references into the table where
+         * the value reference is mutable. Because the underlying
+         * reference to the table is also consumed, no further changes
+         * to the structure of the table are possible; in exchange for
+         * this, the returned references have a longer lifetime than
+         * the references returned by `read_mut()`.
+         */
+        unsafe {
+            let FullBucket { index, table, .. } = self;
+            let index = index as int; // FIXME
+            (&mut *table.keys.offset(index),
+             &mut *table.values.offset(index))
         }
     }
 }
