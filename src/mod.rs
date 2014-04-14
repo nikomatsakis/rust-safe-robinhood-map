@@ -19,6 +19,8 @@ use std::num;
 use std::ptr::RawPtr;
 
 mod hit;
+mod test_map;
+mod bench;
 
 //////////////////////////////////////////////////////////////////////////
 
@@ -696,5 +698,3 @@ impl<K:TotalEq+Hash<S>,V,S,H:Hasher<S>+Default> Extendable<(K, V)> for HashMap<K
 
 fn main() { }
 
-#[cfg(test)]
-mod test_map;
